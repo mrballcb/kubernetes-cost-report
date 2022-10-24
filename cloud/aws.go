@@ -4,6 +4,7 @@ package cloud
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -71,16 +72,14 @@ const (
 	cpuMemRelation = 7.2
 )
 
+// Gets filled in by env var at runtime
+var aws_region string = ""
+
 var filtering []*pricing.Filter = []*pricing.Filter{
 	{
 		Type:  aws.String("TERM_MATCH"),
 		Field: aws.String("PurchaseOption"),
 		Value: aws.String("No Upfront"),
-	},
-	{
-		Type:  aws.String("TERM_MATCH"),
-		Field: aws.String("regionCode"),
-		Value: aws.String("eu-west-1"),
 	},
 	{
 		Type:  aws.String("TERM_MATCH"),
@@ -235,7 +234,7 @@ func SpotMetric() ([]Spot, error) {
 		return nil, fmt.Errorf("session: %w", err)
 	}
 
-	svc := ec2.New(ses, aws.NewConfig().WithRegion("eu-west-1"))
+	svc := ec2.New(ses, aws.NewConfig().WithRegion(aws_region))
 	endTime := time.Now()
 	startTime := endTime.AddDate(0, 0, -1)
 	input := &ec2.DescribeSpotPriceHistoryInput{
@@ -267,7 +266,18 @@ func PriceMetric() ([]*Price, error) {
 		return nil, fmt.Errorf("session: %w", err)
 	}
 
+	// Pricing for all regions only available from us-east-1
 	svc := pricing.New(ses, aws.NewConfig().WithRegion("us-east-1"))
+
+	// Add runtime discovered region to filter used to look up pricing
+	var region_filter []*pricing.Filter = []*pricing.Filter{
+		{
+			Type:  aws.String("TERM_MATCH"),
+			Field: aws.String("regionCode"),
+			Value: aws.String(aws_region),
+		},
+	}
+	filtering = append(filtering, region_filter[0])
 
 	input := &pricing.GetProductsInput{
 		Filters:     filtering,
@@ -300,7 +310,7 @@ func listInstances() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: %w", err)
 	}
-	svc := ec2.New(ses, aws.NewConfig().WithRegion("eu-west-1"))
+	svc := ec2.New(ses, aws.NewConfig().WithRegion(aws_region))
 
 	input := &ec2.DescribeInstancesInput{
 		Filters: []*ec2.Filter{
@@ -351,6 +361,9 @@ func AWSMetrics() (prometheus.Gatherer, error) {
 	reg := prometheus.NewRegistry()
 	labelNames := []string{instanceType, instanceOption, CPU, Memory, Unit, AZ, Region}
 	labelUnit := []string{instanceType, instanceOption, Unit, AZ, Region}
+
+	// Update global with value from env var if present
+	aws_region = getConfig("AWS_REGION")
 
 	allMachinePricing := promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
 		Name: "instance_cost_all",
@@ -413,7 +426,7 @@ func spotInstancePriceCalc(spotPricing []Spot, onDemandPricing []*Price, allMach
 					Memory:         valueOnDemand.Memory,
 					Unit:           "Hrs",
 					AZ:             valueSpot.AZ,
-					Region:         "eu-west-1",
+					Region:         aws_region,
 				}).Set(valueSpot.Price)
 				spotUnitPrice := valueSpot.CalcUnitPrice(valueSpot, valueOnDemand)
 				vCPUPricing.With(prometheus.Labels{
@@ -421,28 +434,28 @@ func spotInstancePriceCalc(spotPricing []Spot, onDemandPricing []*Price, allMach
 					instanceOption: "SPOT",
 					Unit:           "Hrs",
 					AZ:             valueSpot.AZ,
-					Region:         "eu-west-1",
+					Region:         aws_region,
 				}).Set(spotUnitPrice.CPUPrice)
 				memPricing.With(prometheus.Labels{
 					instanceType:   valueSpot.InstanceType,
 					instanceOption: "SPOT",
 					Unit:           "Hrs",
 					AZ:             valueSpot.AZ,
-					Region:         "eu-west-1",
+					Region:         aws_region,
 				}).Set(spotUnitPrice.MemPrice)
 				capacity.With(prometheus.Labels{
 					instanceType:   valueSpot.InstanceType,
 					instanceOption: "SPOT",
 					Unit:           "Hrs",
 					AZ:             valueSpot.AZ,
-					Region:         "eu-west-1",
+					Region:         aws_region,
 				}).Set(spotUnitPrice.Capacity)
 				discount.With(prometheus.Labels{
 					instanceType:   valueSpot.InstanceType,
 					instanceOption: "SPOT",
 					Unit:           "Hrs",
 					AZ:             valueSpot.AZ,
-					Region:         "eu-west-1",
+					Region:         aws_region,
 				}).Set(spotUnitPrice.Discount)
 
 				inUseOnDemnandMachineCalc(instanceTypes, valueSpot, inUseMachinePricing, valueOnDemand)
@@ -462,21 +475,21 @@ func instancePriceCalc(onDemandPricing []*Price, allMachinePricing, vCPUPricing,
 			Memory:         price.Memory,
 			Unit:           price.Unit,
 			AZ:             "",
-			Region:         "eu-west-1",
+			Region:         aws_region,
 		}).Set(price.Price)
 		vCPUPricing.With(prometheus.Labels{
 			instanceType:   price.InstanceType,
 			instanceOption: "ON_DEMAND",
 			Unit:           price.Unit,
 			AZ:             "",
-			Region:         "eu-west-1",
+			Region:         aws_region,
 		}).Set(onDemandUnitPrice.CPUPrice)
 		memPricing.With(prometheus.Labels{
 			instanceType:   price.InstanceType,
 			instanceOption: "ON_DEMAND",
 			Unit:           price.Unit,
 			AZ:             "",
-			Region:         "eu-west-1",
+			Region:         aws_region,
 		}).Set(onDemandUnitPrice.MemPrice)
 
 		inUseSpotMachineCalc(instanceTypes, price, inUseMachinePricing)
@@ -493,7 +506,7 @@ func inUseSpotMachineCalc(instanceTypes []string, price *Price, inUseMachinePric
 				Memory:         price.Memory,
 				Unit:           price.Unit,
 				AZ:             "",
-				Region:         "eu-west-1",
+				Region:         aws_region,
 			}).Set(price.Price)
 		}
 	}
@@ -509,8 +522,26 @@ func inUseOnDemnandMachineCalc(instanceTypes []string, valueSpot Spot, inUseMach
 				Memory:         valueOnDemand.Memory,
 				Unit:           "Hrs",
 				AZ:             valueSpot.AZ,
-				Region:         "eu-west-1",
+				Region:         aws_region,
 			}).Set(valueSpot.Price)
 		}
+	}
+}
+
+func getConfig(key string) string {
+	defaultValue := ""
+	switch strings.ToUpper(key) {
+	case "AWS_REGION":
+		defaultValue = "eu-west-1"
+	default:
+		defaultValue = "NOT_SET"
+	}
+	value := os.Getenv(key)
+	if len(value) > 0 {
+		fmt.Println("Detected env var", key, "=", value)
+		return value
+	} else {
+		fmt.Println("Unset", key, "using default =", defaultValue)
+		return defaultValue
 	}
 }
